@@ -1,9 +1,9 @@
+
 <p align="center">
   <img src="https://afkdev.app/hero-image.webp" alt="AFK - Vibe coding from your couch" width="600">
 </p>
-
 <h1 align="center">
-  <img src="assets/app_icon.png" alt="" width="40" style="vertical-align: middle;">
+  <img src="assets/app_icon.png" alt="" width="28" style="vertical-align: middle;">
   AFK Host
 </h1>
 
@@ -21,7 +21,9 @@
 
 ---
 
+
 ## What is AFK?
+
 
 AFK is a remote desktop app designed for **vibe coding** — directing AI agents like Claude Code from your phone using voice commands while lounging on your couch.
 
@@ -46,7 +48,7 @@ This repo contains the **host application** that runs on your computer and strea
 
 ## Quick Start
 
-1. **Download** the host app from [afkdev.app/download](https://afkdev.app/download)
+1. **Download** the pre-built host app from [afkdev.app/download](https://afkdev.app/download)
 2. **Install** and grant screen recording permission when prompted
 3. **Get the mobile app** on [iOS](https://apps.apple.com/app/afk-remote/id6756719961) or [Android](https://play.google.com/store/apps/details?id=app.afkdev.afk)
 4. **Pair** by entering the 6-digit code shown on your computer
