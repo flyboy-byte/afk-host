@@ -1,0 +1,7 @@
+#include "../../Flutter/Flutter-Debug.xcconfig"
+#include "Warnings.xcconfig"
+#include "AppInfo.xcconfig"
+
+// Override for debug builds (must come after AppInfo.xcconfig)
+PRODUCT_BUNDLE_IDENTIFIER = app.afkdev.macos.dev
+PRODUCT_NAME = AFK Host Dev

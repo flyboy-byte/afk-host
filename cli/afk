@@ -1,0 +1,17 @@
+#!/bin/sh
+# AFK CLI launcher — runs TypeScript natively via Node 24+
+# Resolves symlinks so it works when installed via /usr/local/bin/afk → app bundle.
+
+SOURCE="$0"
+while [ -L "$SOURCE" ]; do
+  DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  # Resolve relative symlinks
+  case "$SOURCE" in
+    /*) ;;
+    *) SOURCE="$DIR/$SOURCE" ;;
+  esac
+done
+SCRIPT_DIR="$(cd "$(dirname "$SOURCE")" && pwd)"
+
+exec node --experimental-strip-types --disable-warning=ExperimentalWarning "$SCRIPT_DIR/src/main.ts" "$@"

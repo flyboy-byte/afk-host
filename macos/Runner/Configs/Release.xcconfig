@@ -1,0 +1,6 @@
+#include "../../Flutter/Flutter-Release.xcconfig"
+#include "Warnings.xcconfig"
+#include "AppInfo.xcconfig"
+
+// Production bundle identifier (same as AppInfo.xcconfig, but explicit for clarity)
+PRODUCT_BUNDLE_IDENTIFIER = app.afkdev.macos
