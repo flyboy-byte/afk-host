@@ -1,3 +1,11 @@
+# AI session files (Claude Code, Codex, agent scaffolding)
+.claude/
+.codex/
+AGENTS.md
+CONTEXT.md
+RESUME.md
+WAYLAND_TEST_PLAN.md
+
 # Wrangler (Cloudflare) cache
 .wrangler/
 
