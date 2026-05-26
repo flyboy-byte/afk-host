@@ -3,6 +3,7 @@
 library;
 
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'device_storage.dart';
@@ -117,43 +118,59 @@ class WebRTCService {
     }
     _isCapturingScreen = true;
 
+    // Log platform and session information for diagnostics
+    if (Platform.isLinux) {
+      final sessionType = Platform.environment['XDG_SESSION_TYPE'] ?? 'unknown';
+      final desktop = Platform.environment['XDG_CURRENT_DESKTOP'] ?? 'unknown';
+      hlog('Linux capture attempt: session=$sessionType, desktop=$desktop', source: 'WebRTC');
+    }
+
     try {
       // Get available screen sources
+      hlog('Calling desktopCapturer.getSources()...', source: 'WebRTC');
       final sources = await desktopCapturer.getSources(
         types: [SourceType.Screen],
       );
+      hlog('desktopCapturer.getSources() returned ${sources.length} source(s)', source: 'WebRTC');
 
       if (sources.isEmpty) {
         hlog('No screen sources available', source: 'WebRTC');
         return false;
       }
 
+      // Log all available sources
+      for (var i = 0; i < sources.length; i++) {
+        final s = sources[i];
+        hlog('  Source $i: name="${s.name}", id="${s.id}"', source: 'WebRTC');
+      }
+
       // Use the first (main) screen
       final source = sources.first;
       _streamingSourceId = source.id;
-      hlog('Capturing screen: ${source.name} (id: ${source.id})', source: 'WebRTC');
+      hlog('Selected screen: ${source.name} (id: ${source.id})', source: 'WebRTC');
 
       // Start screen capture with constraints
+      hlog('Calling getDisplayMedia() with sourceId=${source.id}...', source: 'WebRTC');
       _localStream = await navigator.mediaDevices.getDisplayMedia({
         'video': {
           'deviceId': {'exact': source.id},
-          'mandatory': {
-            'minWidth': 1920,
-            'minHeight': 1080,
-            'frameRate': 30.0,
-          },
+          'frameRate': {'ideal': 30, 'max': 30},
         },
         'audio': false,
       });
+      hlog('getDisplayMedia() succeeded, stream acquired', source: 'WebRTC');
 
       // Add video track to peer connection
       final videoTracks = _localStream!.getVideoTracks();
+      hlog('Stream has ${videoTracks.length} video track(s)', source: 'WebRTC');
+
       if (videoTracks.isEmpty) {
         hlog('No video tracks in captured stream', source: 'WebRTC');
         return false;
       }
 
       final videoTrack = videoTracks.first;
+      hlog('Video track: id=${videoTrack.id}, label="${videoTrack.label}", enabled=${videoTrack.enabled}', source: 'WebRTC');
 
       // Ensure the track is enabled
       videoTrack.enabled = true;
@@ -226,8 +243,17 @@ class WebRTCService {
 
       hlog('Screen capture started, track added to peer connection', source: 'WebRTC');
       return true;
-    } catch (e) {
+    } catch (e, stackTrace) {
       hlog('Failed to start screen capture: $e', source: 'WebRTC');
+      hlog('Stack trace: $stackTrace', source: 'WebRTC');
+
+      // Additional context for Linux debugging
+      if (Platform.isLinux) {
+        final sessionType = Platform.environment['XDG_SESSION_TYPE'] ?? 'unknown';
+        hlog('Capture failed on Linux $sessionType session', source: 'WebRTC');
+        hlog('Known issue: flutter_webrtc may not support PipeWire/Wayland - see issue #1542', source: 'WebRTC');
+      }
+
       return false;
     } finally {
       _isCapturingScreen = false;

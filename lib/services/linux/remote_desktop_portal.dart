@@ -519,57 +519,48 @@ class RemoteDesktopPortal {
     return (x * width, y * height);
   }
 
-  // Track last position for relative motion fallback
+  // Track last normalized position for delta computation
   double _lastX = 0.5;
   double _lastY = 0.5;
+  int _moveCount = 0;
 
-  /// Move pointer to absolute position (normalized 0-1 coordinates)
+  /// Move pointer to normalized position (0-1 coordinates).
+  ///
+  /// Uses NotifyPointerMotion (relative deltas) rather than
+  /// NotifyPointerMotionAbsolute. The absolute API requires a PipeWire stream
+  /// node from the ScreenCast session; on KDE the XDP virtual display is placed
+  /// at a global offset (e.g. x:1536), so passing stream-relative coords causes
+  /// the portal to add that offset and place the cursor completely off-screen.
+  /// Relative motion avoids this entirely.
   Future<bool> notifyPointerMotionAbsolute(double x, double y) async {
     if (_state != PortalSessionState.active || _sessionHandle == null) {
       return false;
     }
 
-    // If we have a stream, use absolute positioning
-    if (_streamNodeId != null) {
-      try {
-        final (screenX, screenY) = _normalizedToScreen(x, y);
+    final displayWidth = _screenSize?.width ?? 1920;
+    final displayHeight = _screenSize?.height ?? 1080;
+    final dx = (x - _lastX) * displayWidth;
+    final dy = (y - _lastY) * displayHeight;
 
-        await _portal!.callMethod(
-          'org.freedesktop.portal.RemoteDesktop',
-          'NotifyPointerMotionAbsolute',
-          [
-            _sessionHandle!,
-            DBusDict.stringVariant({}), // options
-            DBusUint32(_streamNodeId!),
-            DBusDouble(screenX),
-            DBusDouble(screenY),
-          ],
-          replySignature: DBusSignature(''),
-        );
-        
-        _lastX = x;
-        _lastY = y;
-        return true;
-      } catch (e) {
-        hlog('NotifyPointerMotionAbsolute failed: $e, falling back to relative', source: 'Portal');
-        // Fall through to relative motion
-      }
+    _moveCount++;
+    if (_moveCount <= 3) {
+      hlog(
+        'Move #$_moveCount: norm=($x,$y) delta=($dx,$dy) '
+        'scale=${displayWidth}x${displayHeight}',
+        source: 'Portal',
+      );
     }
 
-    // Fallback: Use relative motion
-    try {
-      final dx = (x - _lastX) * (_screenSize?.width ?? 1920);
-      final dy = (y - _lastY) * (_screenSize?.height ?? 1080);
-      
-      _lastX = x;
-      _lastY = y;
+    _lastX = x;
+    _lastY = y;
 
+    try {
       await _portal!.callMethod(
         'org.freedesktop.portal.RemoteDesktop',
         'NotifyPointerMotion',
         [
           _sessionHandle!,
-          DBusDict.stringVariant({}), // options
+          DBusDict.stringVariant({}),
           DBusDouble(dx),
           DBusDouble(dy),
         ],
@@ -696,6 +687,11 @@ class RemoteDesktopPortal {
 
     _sessionHandle = null;
     _state = PortalSessionState.disconnected;
+    _streamNodeId = null;
+    _screenSize = null;
+    _lastX = 0.5;
+    _lastY = 0.5;
+    _moveCount = 0;
 
     hlog('Session stopped', source: 'Portal');
   }
