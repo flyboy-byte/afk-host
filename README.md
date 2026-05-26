@@ -9,7 +9,7 @@
 
 <p align="center">
   <strong>Remote desktop host for <a href="https://afkdev.app">AFK</a></strong><br>
-  Stream your Mac or Windows screen to your phone and control it with touch and voice.
+  Stream your Mac, Windows, or Linux screen to your phone and control it with touch and voice.
 </p>
 
 <p align="center">
@@ -44,7 +44,7 @@ This repo contains the **host application** that runs on your computer and strea
 |----------|--------|
 | macOS | ✅ Stable |
 | Windows | 🚧 In development |
-| Linux | 💭 Planned |
+| Linux (Wayland/KDE) | 🧪 Experimental |
 
 ## Quick Start
 
@@ -61,7 +61,7 @@ Requires [Flutter](https://flutter.dev/docs/get-started/install) 3.10+
 
 ```bash
 # Clone the repo
-git clone https://github.com/liboshen/afk-host.git
+git clone https://github.com/flyboy-byte/afk-host.git
 cd afk-host
 
 # Install dependencies
@@ -70,11 +70,28 @@ flutter pub get
 # Run
 flutter run -d macos    # macOS
 flutter run -d windows  # Windows (rough edges)
+flutter run -d linux    # Linux (Wayland — see notes below)
 
 # Build release
 flutter build macos
 flutter build windows
+flutter build linux
 ```
+
+### Linux (Wayland)
+
+Tested on KDE Plasma 6 with a Wayland session. Requirements:
+
+- **PipeWire** — used for screen capture (libwebrtc falls back to PipeWire when `DISPLAY` is unset on Wayland)
+- **xdg-desktop-portal** with a Wayland-capable backend (e.g. `xdg-desktop-portal-kde` or `xdg-desktop-portal-wlr`)
+- **Node.js 22.6+** — required by the `afk` CLI (`--experimental-strip-types`); on Arch: `pacman -S nodejs-lts-krypton`
+
+The app automatically unsets `DISPLAY` at startup on Wayland so libwebrtc uses PipeWire instead of XWayland (which would produce black frames). Mouse input is injected via the `org.freedesktop.portal.RemoteDesktop` D-Bus portal using relative motion.
+
+**Known limitations on Linux:**
+- Window switcher not supported (no native plugin)
+- Cursor sync not supported
+- Sessions may drop after ~1–2 minutes (ICE keepalive issue under investigation)
 
 ## License
 
