@@ -5,6 +5,7 @@ library;
 
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
@@ -15,6 +16,7 @@ import 'cursor_service.dart';
 import 'device_storage.dart';
 import 'display_wake_service.dart';
 import 'input_service.dart';
+import 'linux/linux_input_handler.dart';
 import 'log_service.dart';
 import 'network_monitor_service.dart';
 import 'cli_server.dart';
@@ -442,6 +444,13 @@ class RemoteSessionManager extends ChangeNotifier
     WindowManagerService.shared.stopMonitoring();
     WindowManagerService.shared.sendDataChannelMessage = null;
     await _webrtcService.closePeerConnection();
+
+    // Dispose the Linux input handler so the portal session is properly closed
+    // and re-initialized on the next connection (fixes stale D-Bus session and
+    // double KDE screen-sharing indicator dots).
+    if (Platform.isLinux) {
+      await LinuxInputHandler.shared.dispose();
+    }
   }
 
   String _formatDuration(Duration d) {

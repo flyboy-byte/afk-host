@@ -685,6 +685,27 @@ class RemoteDesktopPortal {
   Future<void> stopSession() async {
     hlog('Stopping RemoteDesktop session...', source: 'Portal');
 
+    // Explicitly close the D-Bus session so KDE removes its screen-sharing
+    // indicator immediately rather than waiting for connection drop detection.
+    if (_sessionHandle != null && _client != null) {
+      try {
+        final sessionObj = DBusRemoteObject(
+          _client!,
+          name: 'org.freedesktop.portal.Desktop',
+          path: _sessionHandle!,
+        );
+        await sessionObj.callMethod(
+          'org.freedesktop.portal.Session',
+          'Close',
+          [],
+          replySignature: DBusSignature(''),
+        );
+        hlog('Session closed on portal', source: 'Portal');
+      } catch (e) {
+        hlog('Session close error (ignored): $e', source: 'Portal');
+      }
+    }
+
     _sessionHandle = null;
     _state = PortalSessionState.disconnected;
     _streamNodeId = null;
