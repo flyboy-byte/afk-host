@@ -6,7 +6,10 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter_webrtc/flutter_webrtc.dart';
+import 'package:pipewire_video_capture/pipewire_video_capture.dart';
 import 'device_storage.dart';
+import 'linux/linux_input_handler.dart';
+import 'linux/remote_desktop_portal.dart';
 import 'log_service.dart';
 
 /// Delegate for WebRTC events
@@ -25,6 +28,7 @@ class WebRTCService {
   RTCDataChannel? _dataChannel;
   MediaStream? _localStream;
   bool _isCapturingScreen = false;
+  bool _usingV4l2Bridge = false;
 
   RTCPeerConnectionState _connectionState = RTCPeerConnectionState.RTCPeerConnectionStateNew;
 
@@ -123,6 +127,15 @@ class WebRTCService {
       final sessionType = Platform.environment['XDG_SESSION_TYPE'] ?? 'unknown';
       final desktop = Platform.environment['XDG_CURRENT_DESKTOP'] ?? 'unknown';
       hlog('Linux capture attempt: session=$sessionType, desktop=$desktop', source: 'WebRTC');
+
+      // Try the PipeWire→V4L2 bridge first. If v4l2loopback is not loaded the
+      // plugin returns a NO_V4L2 error and we fall through to getDisplayMedia.
+      final v4l2Result = await _tryLinuxV4l2Capture();
+      if (v4l2Result) {
+        _isCapturingScreen = false;
+        return true;
+      }
+      hlog('V4L2 bridge unavailable, falling back to getDisplayMedia', source: 'WebRTC');
     }
 
     try {
@@ -177,69 +190,8 @@ class WebRTCService {
 
       // Add track to peer connection (creates transceiver implicitly)
       final sender = await _peerConnection!.addTrack(videoTrack, _localStream!);
-
-      // Configure encoding parameters based on user's stream quality setting
-      try {
-        final parameters = sender.parameters;
-        if (parameters.encodings != null && parameters.encodings!.isNotEmpty) {
-          final scaleFactor = DeviceStorage.shared.getStreamQuality();
-          parameters.encodings![0].maxBitrate = 8000000; // 8 Mbps
-          parameters.encodings![0].scaleResolutionDownBy = scaleFactor;
-          await sender.setParameters(parameters);
-          hlog('Encoding: scaleResolutionDownBy=$scaleFactor', source: 'WebRTC');
-        }
-      } catch (e) {
-        hlog('Failed to set encoding parameters: $e', source: 'WebRTC');
-      }
-
-      // Verify transceiver was created
-      final transceivers = await _peerConnection!.getTransceivers();
-
-      for (final transceiver in transceivers) {
-        if (transceiver.sender.track?.kind == 'video') {
-          try {
-            final capabilities = await getRtpSenderCapabilities('video');
-
-            
-            List<RTCRtpCodecCapability> prioritizedCodecs = [];
-            List<RTCRtpCodecCapability> otherCodecs = [];
-            
-            final codecs = capabilities.codecs ?? [];
-            
-            // 1. Find VP9 (Preferred by Swift Host/iOS Client)
-            for (var c in codecs) {
-              if (c.mimeType.toLowerCase().contains('vp9')) {
-                prioritizedCodecs.add(c);
-                break; // Just take the first VP9 profile
-              }
-            }
-            
-            // 2. Find H264 (Compatible with Rust/iOS)
-            for (var c in codecs) {
-              if (c.mimeType.toLowerCase().contains('h264')) {
-                // Note: older versions of flutter_webrtc might not expose parameters/sdpFmtpLine easily
-                // or use different property names. We include all H264 profiles here.
-                // Since VP9 is prioritized above, this acts as a fallback.
-                prioritizedCodecs.add(c);
-              }
-            }
-            
-            // 3. Add everything else
-            for (var c in codecs) {
-              if (!prioritizedCodecs.contains(c)) {
-                otherCodecs.add(c);
-              }
-            }
-
-            final finalCodecs = [...prioritizedCodecs, ...otherCodecs];
-            if (finalCodecs.isNotEmpty) {
-              await transceiver.setCodecPreferences(finalCodecs);
-            }
-          } catch (e) {
-            hlog('Failed to set codec preferences: $e', source: 'WebRTC');
-          }
-        }
-      }
+      await _applyEncodingParams(sender);
+      await _applyCodecPreferences();
 
       hlog('Screen capture started, track added to peer connection', source: 'WebRTC');
       return true;
@@ -373,6 +325,13 @@ class WebRTCService {
     _isCapturingScreen = false;
     _streamingSourceId = null;
 
+    if (_usingV4l2Bridge) {
+      _usingV4l2Bridge = false;
+      try {
+        await PipewireVideoCapture.dispose();
+      } catch (_) {}
+    }
+
     // Stop screen capture
     _localStream?.getTracks().forEach((track) {
       track.stop();
@@ -394,6 +353,129 @@ class WebRTCService {
   }
 
   // MARK: - Private Methods
+
+  /// Attempt to start screen capture via the PipeWire→V4L2 loopback bridge.
+  ///
+  /// Initialises the portal session (which is also used for cursor/keyboard
+  /// input) so that both video capture and cursor injection share the same
+  /// PipeWire stream node. That alignment is what makes absolute mouse
+  /// positioning work correctly.
+  ///
+  /// Returns true if capture started successfully, false if v4l2loopback is not
+  /// available or any other step fails (caller falls back to getDisplayMedia).
+  Future<bool> _tryLinuxV4l2Capture() async {
+    // Portal session must be active before OpenPipeWireRemote can be called.
+    // LinuxInputHandler.initialize() starts the portal if not already running.
+    final portalReady = await LinuxInputHandler.shared.initialize();
+    if (!portalReady) {
+      hlog('Portal not ready, cannot use V4L2 bridge', source: 'WebRTC');
+      return false;
+    }
+
+    final portal = RemoteDesktopPortal.shared;
+    final sessionHandle = portal.sessionHandle;
+    if (portal.streamNodeId == 0 || portal.streamSize == null || sessionHandle == null) {
+      hlog('No stream info from portal (nodeId=${portal.streamNodeId}, handle=$sessionHandle)', source: 'WebRTC');
+      return false;
+    }
+
+    final size = portal.streamSize!;
+    final width  = size.width.toInt();
+    final height = size.height.toInt();
+
+    String devicePath;
+    try {
+      devicePath = await PipewireVideoCapture.initialize(
+        sessionHandle: sessionHandle,
+        nodeId: portal.streamNodeId,
+        width:  width,
+        height: height,
+      );
+    } on Exception catch (e) {
+      hlog('PipewireVideoCapture.initialize failed: $e', source: 'WebRTC');
+      return false;
+    }
+
+    hlog('PipeWire→V4L2 bridge active: $devicePath (${width}x$height, node=${portal.streamNodeId})', source: 'WebRTC');
+
+    try {
+      _localStream = await navigator.mediaDevices.getUserMedia({
+        'video': {
+          'deviceId': {'exact': devicePath},
+          'width':  {'ideal': width},
+          'height': {'ideal': height},
+          'frameRate': {'ideal': 30, 'max': 30},
+        },
+        'audio': false,
+      });
+    } catch (e) {
+      hlog('getUserMedia for V4L2 device failed: $e', source: 'WebRTC');
+      await PipewireVideoCapture.dispose();
+      return false;
+    }
+
+    final videoTracks = _localStream!.getVideoTracks();
+    if (videoTracks.isEmpty) {
+      hlog('V4L2 stream has no video tracks', source: 'WebRTC');
+      await PipewireVideoCapture.dispose();
+      return false;
+    }
+
+    final videoTrack = videoTracks.first;
+    videoTrack.enabled = true;
+    _streamingSourceId = devicePath;
+    _usingV4l2Bridge   = true;
+
+    final sender = await _peerConnection!.addTrack(videoTrack, _localStream!);
+    await _applyEncodingParams(sender);
+    await _applyCodecPreferences();
+
+    hlog('Linux V4L2 capture started (absolute mouse precision enabled)', source: 'WebRTC');
+    return true;
+  }
+
+  Future<void> _applyEncodingParams(RTCRtpSender sender) async {
+    try {
+      final parameters = sender.parameters;
+      if (parameters.encodings != null && parameters.encodings!.isNotEmpty) {
+        final scaleFactor = DeviceStorage.shared.getStreamQuality();
+        parameters.encodings![0].maxBitrate = 8000000;
+        parameters.encodings![0].scaleResolutionDownBy = scaleFactor;
+        await sender.setParameters(parameters);
+        hlog('Encoding: scaleResolutionDownBy=$scaleFactor', source: 'WebRTC');
+      }
+    } catch (e) {
+      hlog('Failed to set encoding parameters: $e', source: 'WebRTC');
+    }
+  }
+
+  Future<void> _applyCodecPreferences() async {
+    final transceivers = await _peerConnection!.getTransceivers();
+    for (final transceiver in transceivers) {
+      if (transceiver.sender.track?.kind == 'video') {
+        try {
+          final capabilities = await getRtpSenderCapabilities('video');
+          final codecs = capabilities.codecs ?? [];
+          final List<RTCRtpCodecCapability> ordered = [];
+          for (var c in codecs) {
+            if (c.mimeType.toLowerCase().contains('vp9')) {
+              ordered.add(c);
+              break;
+            }
+          }
+          for (var c in codecs) {
+            if (c.mimeType.toLowerCase().contains('h264')) ordered.add(c);
+          }
+          for (var c in codecs) {
+            if (!ordered.contains(c)) ordered.add(c);
+          }
+          if (ordered.isNotEmpty) await transceiver.setCodecPreferences(ordered);
+        } catch (e) {
+          hlog('Failed to set codec preferences: $e', source: 'WebRTC');
+        }
+      }
+    }
+  }
 
   Future<void> _initializeDataChannel() async {
     if (_peerConnection == null) return;

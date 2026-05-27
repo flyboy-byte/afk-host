@@ -43,14 +43,24 @@ class RemoteDesktopPortal {
   // Session handle (D-Bus object path)
   DBusObjectPath? _sessionHandle;
 
-  // Stream node ID from ScreenCast (needed for absolute positioning)
+  // Stream node ID from ScreenCast portal Start response
   int? _streamNodeId;
-  
+
+  /// PipeWire stream node ID (0 if session not started).
+  int get streamNodeId => _streamNodeId ?? 0;
+
+  /// D-Bus session object path, or null if not active.
+  /// Passed to the C++ plugin so it can call OpenPipeWireRemote itself.
+  String? get sessionHandle => _sessionHandle?.value;
+
   // Whether we have a valid stream for absolute positioning
   bool get hasStream => _streamNodeId != null;
 
   // Screen size for coordinate conversion
   Size? _screenSize;
+
+  /// Stream dimensions from the portal ScreenCast session, or null.
+  Size? get streamSize => _screenSize;
 
 
 
@@ -512,13 +522,6 @@ class RemoteDesktopPortal {
     hlog('Screen size set to: ${size.width}x${size.height}', source: 'Portal');
   }
 
-  /// Convert normalized coordinates (0-1) to screen coordinates
-  (double, double) _normalizedToScreen(double x, double y) {
-    final width = _screenSize?.width ?? 1920;
-    final height = _screenSize?.height ?? 1080;
-    return (x * width, y * height);
-  }
-
   // Track last normalized position for delta computation
   double _lastX = 0.5;
   double _lastY = 0.5;
@@ -546,7 +549,7 @@ class RemoteDesktopPortal {
     if (_moveCount <= 3) {
       hlog(
         'Move #$_moveCount: norm=($x,$y) delta=($dx,$dy) '
-        'scale=${displayWidth}x${displayHeight}',
+        'scale=${displayWidth}x$displayHeight',
         source: 'Portal',
       );
     }
