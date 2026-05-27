@@ -86,12 +86,24 @@ Tested on KDE Plasma 6 with a Wayland session. Requirements:
 - **xdg-desktop-portal** with a Wayland-capable backend (e.g. `xdg-desktop-portal-kde` or `xdg-desktop-portal-wlr`)
 - **Node.js 22.6+** — required by the `afk` CLI (`--experimental-strip-types`); on Arch: `pacman -S nodejs-lts-krypton`
 
-The app automatically unsets `DISPLAY` at startup on Wayland so libwebrtc uses PipeWire instead of XWayland (which would produce black frames). Mouse input is injected via the `org.freedesktop.portal.RemoteDesktop` D-Bus portal using relative motion.
+The app automatically unsets `DISPLAY` at startup on Wayland so libwebrtc uses PipeWire instead of XWayland (which would produce black frames). Mouse input uses `NotifyPointerMotionAbsolute` via `org.freedesktop.portal.RemoteDesktop` — the same portal ScreenCast session provides the stream node ID so tap-to-cursor accuracy is pixel-exact on single-monitor setups.
 
 **Known limitations on Linux:**
 - Window switcher not supported (no native plugin)
 - Cursor sync not supported
-- Sessions may drop after ~1–2 minutes (ICE keepalive issue under investigation)
+- Multi-monitor absolute positioning untested (virtual display offset may shift cursor)
+- Sessions may drop after ~1–2 minutes on LAN without a TURN server (ICE keepalive issue under investigation)
+
+## Mobile App — Things to Investigate
+
+The mobile app ([iOS](https://apps.apple.com/app/afk-remote/id6756719961) / [Android](https://play.google.com/store/apps/details?id=app.afkdev.afk)) is a separate closed-source repo. Open questions worth digging into:
+
+- **TURN server / cellular connectivity** — LAN-only sessions work well; connecting over cellular likely fails ICE without a TURN relay. Look at adding Metered.ca or a self-hosted `coturn` instance to the mobile ICE config.
+- **Session drop at ~72 seconds** — seen on both Linux and potentially mobile; investigate whether it's a libwebrtc PipeWire keepalive bug or an ICE consent refresh issue on the mobile side.
+- **Paste text** — `LinuxInputHandler.pasteText()` is stubbed; mobile needs to send clipboard content and the host needs to synthesize it (portal `NotifyKeyboardKeysym` or type chars individually).
+- **Multi-monitor source selection** — host currently captures the first ScreenCast source; mobile UI has no way to pick a monitor. Consider exposing source selection in the connection handshake.
+- **Cursor image sync** — host knows the cursor shape (via portal cursor image API or polling); mobile renders a fixed crosshair. Streaming cursor bitmaps would improve feel.
+- **Touch gesture mapping** — pinch/two-finger scroll handling on the mobile side; verify gesture deltas are scaled correctly for high-DPI hosts.
 
 ## License
 
