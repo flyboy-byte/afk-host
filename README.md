@@ -88,6 +88,50 @@ Tested on KDE Plasma 6 with a Wayland session. Requirements:
 
 The app automatically unsets `DISPLAY` at startup on Wayland so libwebrtc uses PipeWire instead of XWayland (which would produce black frames). Mouse input uses `NotifyPointerMotionAbsolute` via `org.freedesktop.portal.RemoteDesktop` — the same portal ScreenCast session provides the stream node ID so tap-to-cursor accuracy is pixel-exact on single-monitor setups.
 
+#### How absolute mouse positioning works
+
+Getting `NotifyPointerMotionAbsolute` working on Wayland required a few non-obvious pieces:
+
+**1. Single combined portal session**
+
+The RemoteDesktop portal requires a stream node ID to anchor absolute coordinates. You get that node ID from a ScreenCast session — but both sessions must be created together in one `CreateSession` call (request types `RemoteDesktop | ScreenCast`). The stream node ID is returned in the `Start` response and passed as the third argument to `NotifyPointerMotionAbsolute`.
+
+**2. `OpenPipeWireRemote` must run on the same D-Bus connection that owns the session**
+
+If you call `OpenPipeWireRemote` from a different process or a new D-Bus connection you get `AccessDenied: Invalid session`. The call must go through the exact same connection object that created the session. In this app that means keeping the call in Dart (`dbus` package connection) rather than delegating it to the C++ PipeWire plugin.
+
+**3. Extracting the PipeWire fd — Dart SDK workaround**
+
+`OpenPipeWireRemote` returns a Unix fd as a `DBusUnixFd`. The obvious path is `ResourceHandle.toRawHandle()` but that method doesn't exist in Dart SDK 3.12.0. Workaround:
+
+1. Snapshot `/proc/self/fd/` before the call.
+2. Call `OpenPipeWireRemote`.
+3. Snapshot again and diff — the new entry is the fd the kernel just handed us.
+4. Call `dup()` via `dart:ffi` immediately so the Dart GC can't close the original before the C++ plugin reads it.
+
+```dart
+import 'dart:ffi' hide Size;  // 'hide Size' avoids conflict with dart:ui
+
+final _dup = DynamicLibrary.open('libc.so.6')
+    .lookupFunction<Int32 Function(Int32), int Function(int)>('dup');
+
+Set<int> _scanOpenFds() {
+  final fds = <int>{};
+  for (final e in Directory('/proc/self/fd').listSync()) {
+    final n = int.tryParse(e.path.split('/').last);
+    if (n == null) continue;
+    try { Link('/proc/self/fd/$n').targetSync(); fds.add(n); } catch (_) {}
+  }
+  return fds;
+}
+```
+
+Each fd is validated with `Link('/proc/self/fd/$n').targetSync()` to skip entries whose underlying file was already closed (the directory fd from `listSync` itself closes and its number gets reused by `OpenPipeWireRemote`, which would otherwise appear as a false positive in the diff).
+
+**4. C++ PipeWire plugin**
+
+`pipewire_video_capture/` is a Flutter method-channel plugin written in C++ that receives the duped fd and node ID from Dart, connects to the PipeWire graph, and consumes frames from the portal stream. It was originally intended to bridge frames into a `v4l2loopback` device so libwebrtc could capture them via `getUserMedia` — that part was abandoned because libwebrtc's V4L2 capture path ignores `deviceId` on Linux and always falls back to `/dev/video0`. The plugin still runs and owns the PipeWire stream connection; video is captured separately via `getDisplayMedia`.
+
 **Known limitations on Linux:**
 - Window switcher not supported (no native plugin)
 - Cursor sync not supported
