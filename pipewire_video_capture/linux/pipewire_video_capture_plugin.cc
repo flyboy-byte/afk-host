@@ -169,7 +169,7 @@ static void on_param_changed(void* userdata, uint32_t id,
 }
 
 static const struct pw_stream_events kStreamEvents = {
-    PW_VERSION_STREAM_EVENTS,
+    .version       = PW_VERSION_STREAM_EVENTS,
     .state_changed = on_stream_state_changed,
     .param_changed = on_param_changed,
     .process       = on_stream_process,
