@@ -7,7 +7,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PIPEWIRE REQUIRED IMPORTED_TARGET libpipewire-0.3)
-pkg_check_modules(GIO_UNIX REQUIRED IMPORTED_TARGET gio-unix-2.0)
 
 set(PLUGIN_NAME "pipewire_video_capture_plugin")
 
@@ -28,7 +27,6 @@ target_include_directories(${PLUGIN_NAME} INTERFACE
 target_link_libraries(${PLUGIN_NAME} PRIVATE
   flutter
   PkgConfig::PIPEWIRE
-  PkgConfig::GIO_UNIX
   ${GTK_LIBRARIES}
 )
 

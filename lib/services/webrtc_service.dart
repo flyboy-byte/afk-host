@@ -128,14 +128,8 @@ class WebRTCService {
       final desktop = Platform.environment['XDG_CURRENT_DESKTOP'] ?? 'unknown';
       hlog('Linux capture attempt: session=$sessionType, desktop=$desktop', source: 'WebRTC');
 
-      // Try the PipeWire→V4L2 bridge first. If v4l2loopback is not loaded the
-      // plugin returns a NO_V4L2 error and we fall through to getDisplayMedia.
-      final v4l2Result = await _tryLinuxV4l2Capture();
-      if (v4l2Result) {
-        _isCapturingScreen = false;
-        return true;
-      }
-      hlog('V4L2 bridge unavailable, falling back to getDisplayMedia', source: 'WebRTC');
+      // Start the portal session so NotifyPointerMotionAbsolute has a stream node.
+      await LinuxInputHandler.shared.initialize();
     }
 
     try {
@@ -373,9 +367,14 @@ class WebRTCService {
     }
 
     final portal = RemoteDesktopPortal.shared;
-    final sessionHandle = portal.sessionHandle;
-    if (portal.streamNodeId == 0 || portal.streamSize == null || sessionHandle == null) {
-      hlog('No stream info from portal (nodeId=${portal.streamNodeId}, handle=$sessionHandle)', source: 'WebRTC');
+    if (portal.streamNodeId == 0 || portal.streamSize == null) {
+      hlog('No stream info from portal (nodeId=${portal.streamNodeId})', source: 'WebRTC');
+      return false;
+    }
+
+    final pwFd = await portal.openPipeWireRemote();
+    if (pwFd < 0) {
+      hlog('OpenPipeWireRemote failed', source: 'WebRTC');
       return false;
     }
 
@@ -386,7 +385,7 @@ class WebRTCService {
     String devicePath;
     try {
       devicePath = await PipewireVideoCapture.initialize(
-        sessionHandle: sessionHandle,
+        fd:     pwFd,
         nodeId: portal.streamNodeId,
         width:  width,
         height: height,
@@ -398,10 +397,19 @@ class WebRTCService {
 
     hlog('PipeWire→V4L2 bridge active: $devicePath (${width}x$height, node=${portal.streamNodeId})', source: 'WebRTC');
 
+    // Find the WebRTC deviceId for the loopback device. libwebrtc on Linux
+    // identifies cameras by an opaque ID, not the /dev/videoN path.
+    final loopbackDeviceId = await _findLoopbackDeviceId(devicePath);
+    if (loopbackDeviceId == null) {
+      hlog('Could not find loopback device in WebRTC enumeration', source: 'WebRTC');
+      await PipewireVideoCapture.dispose();
+      return false;
+    }
+
     try {
       _localStream = await navigator.mediaDevices.getUserMedia({
         'video': {
-          'deviceId': {'exact': devicePath},
+          'deviceId': {'exact': loopbackDeviceId},
           'width':  {'ideal': width},
           'height': {'ideal': height},
           'frameRate': {'ideal': 30, 'max': 30},
@@ -432,6 +440,44 @@ class WebRTCService {
 
     hlog('Linux V4L2 capture started (absolute mouse precision enabled)', source: 'WebRTC');
     return true;
+  }
+
+  /// Enumerate WebRTC video inputs and return the deviceId for the v4l2loopback
+  /// device. [devPath] is the /dev/videoN path found by the C++ plugin.
+  Future<String?> _findLoopbackDeviceId(String devPath) async {
+    try {
+      final devices = await navigator.mediaDevices.enumerateDevices();
+      final videoInputs = devices.where((d) => d.kind == 'videoinput').toList();
+      hlog('Video inputs (${videoInputs.length}):', source: 'WebRTC');
+      for (final d in videoInputs) {
+        hlog('  id=${d.deviceId} label=${d.label}', source: 'WebRTC');
+      }
+
+      // Try matching by label containing "loopback"
+      for (final d in videoInputs) {
+        if (d.label.toLowerCase().contains('loopback')) {
+          hlog('Matched loopback by label: ${d.deviceId}', source: 'WebRTC');
+          return d.deviceId;
+        }
+      }
+
+      // Try matching by deviceId containing the device number from devPath
+      final devNum = RegExp(r'\d+$').firstMatch(devPath)?.group(0);
+      if (devNum != null) {
+        for (final d in videoInputs) {
+          if (d.deviceId.contains(devNum) || d.deviceId == devPath) {
+            hlog('Matched loopback by device number $devNum: ${d.deviceId}', source: 'WebRTC');
+            return d.deviceId;
+          }
+        }
+      }
+
+      hlog('No loopback device matched among ${videoInputs.length} inputs', source: 'WebRTC');
+      return null;
+    } catch (e) {
+      hlog('enumerateDevices failed: $e', source: 'WebRTC');
+      return null;
+    }
   }
 
   Future<void> _applyEncodingParams(RTCRtpSender sender) async {

@@ -6,6 +6,7 @@
 library;
 
 import 'dart:async';
+import 'dart:ffi' hide Size;
 import 'dart:io';
 import 'dart:ui';
 
@@ -50,7 +51,6 @@ class RemoteDesktopPortal {
   int get streamNodeId => _streamNodeId ?? 0;
 
   /// D-Bus session object path, or null if not active.
-  /// Passed to the C++ plugin so it can call OpenPipeWireRemote itself.
   String? get sessionHandle => _sessionHandle?.value;
 
   // Whether we have a valid stream for absolute positioning
@@ -514,6 +514,80 @@ class RemoteDesktopPortal {
     }
   }
 
+  // libc dup() via FFI — avoids GC-closing the original fd before C++ can dup it.
+  static final _libcDup = DynamicLibrary.open('libc.so.6')
+      .lookupFunction<Int32 Function(Int32), int Function(int)>('dup');
+
+  /// Call OpenPipeWireRemote on the portal using the same D-Bus connection
+  /// that owns the session. Returns a dup'd fd (caller owns it), or -1 on failure.
+  ///
+  /// dart:io gives no public API to extract a raw fd from DBusUnixFd.handle
+  /// (ResourceHandle.toRawHandle() is absent in this SDK). Instead we snapshot
+  /// /proc/self/fd before/after the D-Bus call to find the new fd, then dup() it
+  /// via FFI so the Dart GC closing the original doesn't race the C++ dup.
+  Future<int> openPipeWireRemote() async {
+    if (_state != PortalSessionState.active || _sessionHandle == null || _portal == null) {
+      return -1;
+    }
+    try {
+      final fdsBefore = _scanOpenFds();
+
+      // Call on the SAME D-Bus connection that owns the session — a fresh
+      // connection gets AccessDenied: Invalid session from the portal.
+      final result = await _portal!.callMethod(
+        'org.freedesktop.portal.ScreenCast',
+        'OpenPipeWireRemote',
+        [_sessionHandle!, DBusDict.stringVariant({})],
+        replySignature: DBusSignature('h'),
+      );
+
+      // Keep DBusUnixFd alive so the fd isn't closed by GC during the scan.
+      final dbusUnixFd = result.values.first as DBusUnixFd;
+
+      final fdsAfter = _scanOpenFds();
+      final newFds = fdsAfter.difference(fdsBefore);
+
+      // The /proc/self/fd dir fd opened during fdsAfter scan is already closed;
+      // check which new entries are still open to identify the PipeWire fd.
+      for (final fd in (newFds.toList()..sort())) {
+        try {
+          Link('/proc/self/fd/$fd').targetSync(); // throws if fd is closed
+          final dupFd = _libcDup(fd);
+          if (dupFd < 0) continue;
+          hlog('OpenPipeWireRemote: fd=$fd dup=$dupFd', source: 'Portal');
+          // Touch dbusUnixFd to ensure it wasn't optimised away before dup().
+          assert(dbusUnixFd.handle != null); // ignore: unnecessary_null_comparison
+          return dupFd;
+        } catch (_) {}
+      }
+
+      hlog('OpenPipeWireRemote: no new fd found (newFds=$newFds)', source: 'Portal');
+      return -1;
+    } catch (e) {
+      hlog('OpenPipeWireRemote failed: $e', source: 'Portal');
+      return -1;
+    }
+  }
+
+  // Returns only fds that are currently open (filters out the /proc/self/fd
+  // directory fd which listSync briefly opens and closes before returning).
+  Set<int> _scanOpenFds() {
+    try {
+      final fds = <int>{};
+      for (final e in Directory('/proc/self/fd').listSync()) {
+        final n = int.tryParse(e.path.split('/').last);
+        if (n == null) continue;
+        try {
+          Link('/proc/self/fd/$n').targetSync();
+          fds.add(n);
+        } catch (_) {}
+      }
+      return fds;
+    } catch (_) {
+      return {};
+    }
+  }
+
   // ============ Input Methods ============
 
   /// Set screen size for coordinate conversion
@@ -522,56 +596,34 @@ class RemoteDesktopPortal {
     hlog('Screen size set to: ${size.width}x${size.height}', source: 'Portal');
   }
 
-  // Track last normalized position for delta computation
-  double _lastX = 0.5;
-  double _lastY = 0.5;
-  int _moveCount = 0;
-
   /// Move pointer to normalized position (0-1 coordinates).
-  ///
-  /// Uses NotifyPointerMotion (relative deltas) rather than
-  /// NotifyPointerMotionAbsolute. The absolute API requires a PipeWire stream
-  /// node from the ScreenCast session; on KDE the XDP virtual display is placed
-  /// at a global offset (e.g. x:1536), so passing stream-relative coords causes
-  /// the portal to add that offset and place the cursor completely off-screen.
-  /// Relative motion avoids this entirely.
+  /// Uses NotifyPointerMotionAbsolute with the portal stream node.
   Future<bool> notifyPointerMotionAbsolute(double x, double y) async {
-    if (_state != PortalSessionState.active || _sessionHandle == null) {
+    if (_state != PortalSessionState.active ||
+        _sessionHandle == null ||
+        _streamNodeId == null) {
       return false;
     }
 
-    final displayWidth = _screenSize?.width ?? 1920;
-    final displayHeight = _screenSize?.height ?? 1080;
-    final dx = (x - _lastX) * displayWidth;
-    final dy = (y - _lastY) * displayHeight;
-
-    _moveCount++;
-    if (_moveCount <= 3) {
-      hlog(
-        'Move #$_moveCount: norm=($x,$y) delta=($dx,$dy) '
-        'scale=${displayWidth}x$displayHeight',
-        source: 'Portal',
-      );
-    }
-
-    _lastX = x;
-    _lastY = y;
+    final w = _screenSize?.width ?? 1920;
+    final h = _screenSize?.height ?? 1080;
 
     try {
       await _portal!.callMethod(
         'org.freedesktop.portal.RemoteDesktop',
-        'NotifyPointerMotion',
+        'NotifyPointerMotionAbsolute',
         [
           _sessionHandle!,
           DBusDict.stringVariant({}),
-          DBusDouble(dx),
-          DBusDouble(dy),
+          DBusUint32(_streamNodeId!),
+          DBusDouble(x * w),
+          DBusDouble(y * h),
         ],
         replySignature: DBusSignature(''),
       );
       return true;
     } catch (e) {
-      hlog('NotifyPointerMotion failed: $e', source: 'Portal');
+      hlog('NotifyPointerMotionAbsolute failed: $e', source: 'Portal');
       return false;
     }
   }
@@ -713,9 +765,6 @@ class RemoteDesktopPortal {
     _state = PortalSessionState.disconnected;
     _streamNodeId = null;
     _screenSize = null;
-    _lastX = 0.5;
-    _lastY = 0.5;
-    _moveCount = 0;
 
     hlog('Session stopped', source: 'Portal');
   }

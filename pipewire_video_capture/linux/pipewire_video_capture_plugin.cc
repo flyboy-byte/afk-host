@@ -1,8 +1,6 @@
 #include "include/pipewire_video_capture/pipewire_video_capture_plugin.h"
 
 #include <flutter_linux/flutter_linux.h>
-#include <gio/gio.h>
-#include <gio/gunixfdlist.h>
 #include <gtk/gtk.h>
 
 extern "C" {
@@ -17,11 +15,13 @@ extern "C" {
 #include <sys/ioctl.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 // ─── GObject boilerplate ──────────────────────────────────────────────────────
 
@@ -49,6 +49,9 @@ struct CaptureState {
   int v4l2_fd = -1;
   int width   = 0;
   int height  = 0;
+
+  // Scratch buffer for BGRx→YUYV conversion
+  std::vector<uint8_t> yuyv_buf;
 
   std::atomic<bool> running{false};
   std::thread       pw_thread;
@@ -99,12 +102,33 @@ static bool setup_v4l2_format(int fd, int width, int height) {
   fmt.type                 = V4L2_BUF_TYPE_VIDEO_OUTPUT;
   fmt.fmt.pix.width        = static_cast<uint32_t>(width);
   fmt.fmt.pix.height       = static_cast<uint32_t>(height);
-  fmt.fmt.pix.pixelformat  = V4L2_PIX_FMT_BGR32;
+  fmt.fmt.pix.pixelformat  = V4L2_PIX_FMT_YUYV;  // libwebrtc supports YUYV, not BGR32
   fmt.fmt.pix.field        = V4L2_FIELD_NONE;
-  fmt.fmt.pix.bytesperline = static_cast<uint32_t>(width * 4);
-  fmt.fmt.pix.sizeimage    = static_cast<uint32_t>(width * height * 4);
+  fmt.fmt.pix.bytesperline = static_cast<uint32_t>(width * 2);
+  fmt.fmt.pix.sizeimage    = static_cast<uint32_t>(width * height * 2);
   fmt.fmt.pix.colorspace   = V4L2_COLORSPACE_SRGB;
   return ioctl(fd, VIDIOC_S_FMT, &fmt) == 0;
+}
+
+// BGRx (4 bytes/pixel) → YUYV (2 bytes/pixel) conversion.
+// PipeWire ScreenCast outputs BGRx; libwebrtc's V4L2 capture supports YUYV.
+static void bgrx_to_yuyv(const uint8_t* src, uint8_t* dst, int width, int height) {
+  for (int y = 0; y < height; y++) {
+    const uint8_t* row = src + y * width * 4;
+    uint8_t*       out = dst + y * width * 2;
+    for (int x = 0; x < width; x += 2) {
+      int b0 = row[x*4],     g0 = row[x*4+1], r0 = row[x*4+2];
+      int b1 = row[x*4+4],   g1 = row[x*4+5], r1 = row[x*4+6];
+      int y0 = ((66*r0 + 129*g0 + 25*b0 + 128) >> 8) + 16;
+      int y1 = ((66*r1 + 129*g1 + 25*b1 + 128) >> 8) + 16;
+      int u  = ((-38*(r0+r1) - 74*(g0+g1) + 112*(b0+b1) + 512) >> 9) + 128;
+      int v  = ((112*(r0+r1) - 94*(g0+g1) -  18*(b0+b1) + 512) >> 9) + 128;
+      out[x*2]   = (uint8_t)std::clamp(y0, 16, 235);
+      out[x*2+1] = (uint8_t)std::clamp(u,  16, 240);
+      out[x*2+2] = (uint8_t)std::clamp(y1, 16, 235);
+      out[x*2+3] = (uint8_t)std::clamp(v,  16, 240);
+    }
+  }
 }
 
 // ─── PipeWire callbacks ───────────────────────────────────────────────────────
@@ -116,12 +140,14 @@ static void on_stream_process(void* userdata) {
   if (!b) return;
 
   struct spa_buffer* buf = b->buffer;
-  if (buf->datas[0].data && s->v4l2_fd >= 0) {
-    uint32_t size = buf->datas[0].chunk->size;
-    if (size > 0) {
-      ssize_t w = write(s->v4l2_fd, buf->datas[0].data, size);
-      (void)w;
-    }
+  const auto* src = static_cast<const uint8_t*>(buf->datas[0].data);
+  if (src && s->v4l2_fd >= 0 && s->width > 0 && s->height > 0) {
+    const size_t yuyv_size = static_cast<size_t>(s->width * s->height * 2);
+    if (s->yuyv_buf.size() != yuyv_size)
+      s->yuyv_buf.resize(yuyv_size);
+    bgrx_to_yuyv(src, s->yuyv_buf.data(), s->width, s->height);
+    ssize_t w = write(s->v4l2_fd, s->yuyv_buf.data(), yuyv_size);
+    (void)w;
   }
 
   pw_stream_queue_buffer(s->stream, b);
@@ -163,7 +189,7 @@ static void on_param_changed(void* userdata, uint32_t id,
           SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
           SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(2, 1, 32),
           SPA_PARAM_BUFFERS_blocks,  SPA_POD_Int(1),
-          SPA_PARAM_BUFFERS_size,    SPA_POD_Int(s->width * s->height * 4),
+          SPA_PARAM_BUFFERS_size,    SPA_POD_Int(s->width * s->height * 4),  // source is BGRx
           SPA_PARAM_BUFFERS_stride,  SPA_POD_Int(s->width * 4)));
   pw_stream_update_params(s->stream, params, 1);
 }
@@ -190,58 +216,6 @@ static void capture_destroy(CaptureState* s) {
   delete s;
 }
 
-// ─── OpenPipeWireRemote via GDBus ─────────────────────────────────────────────
-
-// Calls org.freedesktop.portal.ScreenCast.OpenPipeWireRemote on the given
-// session object and returns a dup'd file descriptor, or -1 on error.
-static int open_pipewire_remote(const char* session_handle) {
-  GError* error = nullptr;
-  g_autoptr(GDBusConnection) conn =
-      g_bus_get_sync(G_BUS_TYPE_SESSION, nullptr, &error);
-  if (!conn) {
-    if (error) g_error_free(error);
-    return -1;
-  }
-
-  GUnixFDList* out_fd_list = nullptr;
-  g_autoptr(GVariant) result = g_dbus_connection_call_with_unix_fd_list_sync(
-      conn,
-      "org.freedesktop.portal.Desktop",
-      session_handle,
-      "org.freedesktop.portal.ScreenCast",
-      "OpenPipeWireRemote",
-      g_variant_new("(oa{sv})", session_handle,
-                    g_variant_new("a{sv}", nullptr)),
-      G_VARIANT_TYPE("(h)"),
-      G_DBUS_CALL_FLAGS_NONE,
-      -1, nullptr,
-      &out_fd_list,
-      nullptr, &error);
-
-  if (!result) {
-    if (error) g_error_free(error);
-    return -1;
-  }
-
-  gint32 fd_index = -1;
-  g_variant_get(result, "(h)", &fd_index);
-
-  if (!out_fd_list || fd_index < 0) {
-    if (out_fd_list) g_object_unref(out_fd_list);
-    return -1;
-  }
-
-  int raw_fd = g_unix_fd_list_get(out_fd_list, fd_index, &error);
-  g_object_unref(out_fd_list);
-
-  if (raw_fd < 0) {
-    if (error) g_error_free(error);
-    return -1;
-  }
-
-  return raw_fd;  // caller owns this fd
-}
-
 // ─── Method channel ───────────────────────────────────────────────────────────
 
 static void method_call_cb(FlMethodChannel* /*channel*/,
@@ -260,21 +234,33 @@ static void method_call_cb(FlMethodChannel* /*channel*/,
       return;
     }
 
-    FlValue* v_session = fl_value_lookup_string(args, "sessionHandle");
-    FlValue* v_node    = fl_value_lookup_string(args, "nodeId");
-    FlValue* v_w       = fl_value_lookup_string(args, "width");
-    FlValue* v_h       = fl_value_lookup_string(args, "height");
+    FlValue* v_fd   = fl_value_lookup_string(args, "fd");
+    FlValue* v_node = fl_value_lookup_string(args, "nodeId");
+    FlValue* v_w    = fl_value_lookup_string(args, "width");
+    FlValue* v_h    = fl_value_lookup_string(args, "height");
 
-    if (!v_session || !v_node || !v_w || !v_h) {
+    if (!v_fd || !v_node || !v_w || !v_h) {
       fl_method_call_respond(
           call,
           FL_METHOD_RESPONSE(fl_method_error_response_new(
-              "BAD_ARGS", "Missing sessionHandle/nodeId/width/height", nullptr)),
+              "BAD_ARGS", "Missing fd/nodeId/width/height", nullptr)),
           nullptr);
       return;
     }
 
-    const char* session_handle = fl_value_get_string(v_session);
+    // Dart passes the raw fd from OpenPipeWireRemote. Dup it so Dart's GC can
+    // close the original without racing pw_context_connect_fd taking ownership.
+    int dart_fd = static_cast<int>(fl_value_get_int(v_fd));
+    int pw_fd   = dup(dart_fd);
+    if (pw_fd < 0) {
+      fl_method_call_respond(
+          call,
+          FL_METHOD_RESPONSE(fl_method_error_response_new(
+              "PW_FD", "dup(pipewire_fd) failed", nullptr)),
+          nullptr);
+      return;
+    }
+
     int node_id = static_cast<int>(fl_value_get_int(v_node));
     int width   = static_cast<int>(fl_value_get_int(v_w));
     int height  = static_cast<int>(fl_value_get_int(v_h));
@@ -283,19 +269,6 @@ static void method_call_cb(FlMethodChannel* /*channel*/,
 
     capture_destroy(g_capture);
     g_capture = nullptr;
-
-    // Get PipeWire fd directly via GDBus — avoids Dart fd-passing limitations
-    int pw_fd = open_pipewire_remote(session_handle);
-    if (pw_fd < 0) {
-      fl_method_call_respond(
-          call,
-          FL_METHOD_RESPONSE(fl_method_error_response_new(
-              "PW_FD",
-              "OpenPipeWireRemote D-Bus call failed",
-              nullptr)),
-          nullptr);
-      return;
-    }
 
     // Find a v4l2loopback OUTPUT device
     char dev_path[64]{};
@@ -330,6 +303,20 @@ static void method_call_cb(FlMethodChannel* /*channel*/,
     s->v4l2_fd   = v4l2_fd;
     s->width     = width;
     s->height    = height;
+
+    // Write a solid red YUYV frame so we can confirm getUserMedia opens the loopback.
+    // YUYV for red (R=235,G=16,B=16): Y=81, U=90, V=240 approx
+    {
+      const size_t sz = static_cast<size_t>(width * height * 2);
+      std::vector<uint8_t> red(sz);
+      for (size_t i = 0; i < sz; i += 4) {
+        red[i]   = 81;   // Y0
+        red[i+1] = 90;   // U
+        red[i+2] = 81;   // Y1
+        red[i+3] = 240;  // V
+      }
+      write(v4l2_fd, red.data(), sz);
+    }
 
     s->loop = pw_main_loop_new(nullptr);
     if (!s->loop) {
