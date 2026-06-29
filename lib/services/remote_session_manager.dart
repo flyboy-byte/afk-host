@@ -293,8 +293,8 @@ class RemoteSessionManager extends ChangeNotifier
       _isSettingUpWebRTC = false;
       _updateNativeState();
       notifyListeners();
-    } else if (state == RTCPeerConnectionState.RTCPeerConnectionStateFailed ||
-        state == RTCPeerConnectionState.RTCPeerConnectionStateDisconnected) {
+    } else if (state == RTCPeerConnectionState.RTCPeerConnectionStateFailed) {
+      // Disconnected is transient — libwebrtc will promote it to Failed if ICE can't recover.
       // During reconnection, OLD peer events can arrive while NEW setup is in progress.
       if (_isSettingUpWebRTC) {
         hlog(
