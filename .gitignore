@@ -5,6 +5,7 @@ AGENTS.md
 CONTEXT.md
 RESUME.md
 WAYLAND_TEST_PLAN.md
+claude-resume.sh
 
 # Wrangler (Cloudflare) cache
 .wrangler/
