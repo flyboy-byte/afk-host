@@ -44,7 +44,9 @@ This repo contains the **host application** that runs on your computer and strea
 |----------|--------|
 | macOS | ✅ Stable |
 | Windows | 🚧 In development |
-| Linux (Wayland/KDE) | 🧪 Experimental |
+| Linux — KDE Plasma 6 (Wayland) | 🧪 Experimental — screen + absolute mouse input working |
+| Linux — GNOME (Wayland) | 🧪 Experimental — screen works; input partially tested, video freeze under investigation |
+| Linux — X11 (LXQt, etc.) | ⚠️ Screen only — no input path on X11 |
 
 ## Quick Start
 
@@ -80,11 +82,21 @@ flutter build linux
 
 ### Linux (Wayland)
 
-Tested on KDE Plasma 6 with a Wayland session. Requirements:
+Tested on KDE Plasma 6 (Arch, Wayland) and GNOME 47 (RHEL 10, Wayland). Requirements:
 
 - **PipeWire** — used for screen capture (libwebrtc falls back to PipeWire when `DISPLAY` is unset on Wayland)
-- **xdg-desktop-portal** with a Wayland-capable backend (e.g. `xdg-desktop-portal-kde` or `xdg-desktop-portal-wlr`)
+- **xdg-desktop-portal** with a backend that implements both RemoteDesktop and ScreenCast portals:
+  - KDE: `xdg-desktop-portal-kde` ✅ fully working
+  - GNOME: `xdg-desktop-portal-gnome` ✅ screen working, input partially working (see limitations)
+  - wlr/labwc (LXQt, Sway, Hyprland): `xdg-desktop-portal-wlr` ⚠️ ScreenCast only — no RemoteDesktop portal, input not supported
 - **Node.js 22.6+** — required by the `afk` CLI (`--experimental-strip-types`); on Arch: `pacman -S nodejs-lts-krypton`
+
+**RHEL / Fedora note:** SELinux blocks WebRTC UDP by default. Either configure a targeted policy or set permissive mode for testing:
+```bash
+sudo setenforce 0   # temporary; revert with setenforce 1
+# For a targeted policy (preferred):
+sudo ausearch -m avc -ts today | audit2allow -M afk_host && sudo semodule -i afk_host.pp
+```
 
 The app automatically unsets `DISPLAY` at startup on Wayland so libwebrtc uses PipeWire instead of XWayland (which would produce black frames). Mouse input uses `NotifyPointerMotionAbsolute` via `org.freedesktop.portal.RemoteDesktop` — the same portal ScreenCast session provides the stream node ID so tap-to-cursor accuracy is pixel-exact on single-monitor setups.
 
@@ -137,6 +149,9 @@ Each fd is validated with `Link('/proc/self/fd/$n').targetSync()` to skip entrie
 - Cursor sync not supported
 - Multi-monitor absolute positioning untested (virtual display offset may shift cursor)
 - Sessions may drop after ~1–2 minutes on LAN without a TURN server (ICE keepalive issue under investigation)
+- **GNOME only:** input injection via `NotifyPointerMotionAbsolute` can cause brief video freezes — interaction between two concurrent portal sessions (ours + libwebrtc's `getDisplayMedia`) under investigation
+- **X11 sessions:** screen capture works via libwebrtc's XCB path; input injection not supported (no XTest implementation)
+- **wlr-based compositors** (Sway, Hyprland, labwc/LXQt): screen works, input not supported (`xdg-desktop-portal-wlr` does not implement RemoteDesktop portal)
 
 ## Mobile App — Things to Investigate
 
